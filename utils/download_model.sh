@@ -35,16 +35,40 @@ echo "Checking disk space..."
 df -h "$(dirname "$LOCAL_DIR")" | tail -1
 echo ""
 
-# Download the model
+# Download the model using Python API (more reliable than CLI)
 echo "Starting download (this may take a while)..."
 # Note: HF_HOME and HF_HUB_CACHE are set above to ensure cache goes to /workspace
-huggingface-cli download "$MODEL_NAME" \
-    --local-dir "$LOCAL_DIR" \
-    --local-dir-use-symlinks False
+python << EOF
+import os
+import sys
+from huggingface_hub import snapshot_download
 
-if [ $? -eq 0 ]; then
+model_name = "$MODEL_NAME"
+local_dir = "$LOCAL_DIR"
+cache_dir = "$CACHE_DIR"
+
+# Set environment variables for cache location
+os.environ["HF_HOME"] = cache_dir
+os.environ["HF_HUB_CACHE"] = os.path.join(cache_dir, "hub")
+
+print(f"Downloading {model_name} to {local_dir}...")
+try:
+    snapshot_download(
+        repo_id=model_name,
+        local_dir=local_dir,
+        local_dir_use_symlinks=False,
+        cache_dir=cache_dir
+    )
+    print(f"\n✓ Model downloaded successfully to {local_dir}")
+except Exception as e:
+    print(f"\n✗ Download failed: {e}")
+    sys.exit(1)
+EOF
+
+DOWNLOAD_STATUS=$?
+
+if [ $DOWNLOAD_STATUS -eq 0 ]; then
     echo ""
-    echo "✓ Model downloaded successfully!"
     echo "Local path: $LOCAL_DIR"
     echo ""
     echo "To use this model, set MODEL_PATH in start_vllm_server.sh:"

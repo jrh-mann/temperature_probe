@@ -9,3 +9,6 @@ huggingface_hub[cli]>=0.20.0
 # if you encounter issues. See: https://docs.vllm.ai/en/latest/getting_started/installation.html
 vllm>=0.3.0
 
+datasets
+huggingface_hub
+vllm

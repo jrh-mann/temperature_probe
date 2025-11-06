@@ -14,7 +14,7 @@
 #   - gpt2  (if using local path: /path/to/model)
 
 # Activate virtual environment
-source /root/counterfactual_steering/.venv/bin/activate
+source /root/.venv/bin/activate
 
 # Default configuration
 # IMPORTANT: Set MODEL_NAME or MODEL_PATH
