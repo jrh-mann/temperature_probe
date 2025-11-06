@@ -1,0 +1,11 @@
+# Core dependencies for vLLM client
+openai>=1.0.0
+
+# HuggingFace Hub for downloading models
+huggingface_hub[cli]>=0.20.0
+
+# vLLM for running the inference server
+# Note: vLLM may require specific CUDA versions and should be installed separately
+# if you encounter issues. See: https://docs.vllm.ai/en/latest/getting_started/installation.html
+vllm>=0.3.0
+
