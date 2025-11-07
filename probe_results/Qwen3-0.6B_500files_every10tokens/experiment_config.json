@@ -1,7 +1,7 @@
 {
   "model_name": "Qwen3-0.6B",
   "activations_dir": "/workspace/activations/Qwen3-0.6B",
-  "max_files_per_temp": 100,
+  "max_files_per_temp": 500,
   "token_every_n": 10,
   "test_size": 0.2,
   "val_size": 0.2,
@@ -10,12 +10,7 @@
   "patience": 50,
   "device": "cuda",
   "layers_trained": [
-    21,
-    22,
-    23,
-    24,
-    25,
-    26,
-    27
+    3,
+    7
   ]
 }

@@ -83,6 +83,9 @@ def load_file_activations(file_path, layer_indices, token_every_n=1):
         Dict mapping layer_idx -> tensor of shape (seq_len, hidden_dim)
     """
     acts = torch.load(file_path, map_location='cpu')
+    # Ensure activations are in bfloat16 for consistency
+    if isinstance(acts, torch.Tensor) and acts.dtype != torch.bfloat16:
+        acts = acts.to(dtype=torch.bfloat16)
     # acts shape: (num_layers, 1, seq_len, hidden_dim)
     
     result = {}
@@ -92,6 +95,8 @@ def load_file_activations(file_path, layer_indices, token_every_n=1):
         
         # Extract layer and remove batch dim: (seq_len, hidden_dim)
         layer_acts = acts[layer_idx].squeeze(0)
+        if layer_acts.dtype != torch.bfloat16:
+            layer_acts = layer_acts.to(dtype=torch.bfloat16)
         
         # Sample tokens
         if token_every_n > 1:
@@ -211,7 +216,7 @@ def load_data_by_files(activations_dir, layer_indices, token_every_n=1, max_file
                 # Immediately move to GPU and free CPU memory
                 if move_to_device is not None and move_to_device.type == 'cuda':
                     try:
-                        X = X.to(move_to_device, non_blocking=True)
+                        X = X.to(move_to_device, dtype=torch.bfloat16, non_blocking=True)
                         Y = Y.to(move_to_device, non_blocking=True)
                         # Force cleanup of CPU tensors
                         del layer_data[layer_idx]['X_list'][:]
@@ -225,6 +230,8 @@ def load_data_by_files(activations_dir, layer_indices, token_every_n=1, max_file
                         else:
                             raise
                 
+                if move_to_device is None and X.dtype != torch.bfloat16:
+                    X = X.to(dtype=torch.bfloat16)
                 result[layer_idx] = (X, Y)
         
         # Final cleanup
@@ -311,7 +318,7 @@ def load_data_by_files(activations_dir, layer_indices, token_every_n=1, max_file
 def train_regression_probe(X_train, y_train, X_val, y_val, device, epochs=1000, lr=0.001, patience=50):
     """Train linear regression probe."""
     input_dim = X_train.shape[1]
-    model = LinearProbe(input_dim).to(device)
+    model = LinearProbe(input_dim).to(device=device, dtype=torch.bfloat16)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
     
@@ -320,17 +327,27 @@ def train_regression_probe(X_train, y_train, X_val, y_val, device, epochs=1000, 
     X_std = X_train.std(dim=0, keepdim=True) + 1e-8
     
     # Standardize and ensure on correct device
-    X_train_scaled = (X_train - X_mean) / X_std
+    X_mean_bf16 = X_mean.to(device=X_train.device, dtype=X_train.dtype)
+    X_std_bf16 = X_std.to(device=X_train.device, dtype=X_train.dtype)
+    X_train_scaled = (X_train - X_mean_bf16) / X_std_bf16
     if X_train_scaled.device != device:
-        X_train_scaled = X_train_scaled.to(device, non_blocking=True)
+        X_train_scaled = X_train_scaled.to(device, dtype=torch.bfloat16, non_blocking=True)
     
     y_train_t = y_train if y_train.device == device else y_train.to(device, non_blocking=True)
+    y_train_t = y_train_t.to(dtype=torch.bfloat16)
+    y_train_float = y_train_t.to(dtype=torch.float32)
     
     if X_val is not None:
-        X_val_scaled = (X_val - X_mean) / X_std
+        X_val_scaled = (X_val - X_mean.to(device=X_val.device, dtype=X_val.dtype)) / X_std.to(device=X_val.device, dtype=X_val.dtype)
         if X_val_scaled.device != device:
-            X_val_scaled = X_val_scaled.to(device, non_blocking=True)
+            X_val_scaled = X_val_scaled.to(device, dtype=torch.bfloat16, non_blocking=True)
         y_val_t = y_val if y_val.device == device else y_val.to(device, non_blocking=True)
+        y_val_t = y_val_t.to(dtype=torch.bfloat16)
+        y_val_float = y_val_t.to(dtype=torch.float32)
+    else:
+        X_val_scaled = None
+        y_val_t = None
+        y_val_float = None
     
     best_val_loss = float('inf')
     patience_counter = 0
@@ -341,17 +358,17 @@ def train_regression_probe(X_train, y_train, X_val, y_val, device, epochs=1000, 
         optimizer.zero_grad()
         
         y_pred = model(X_train_scaled)
-        loss = criterion(y_pred, y_train_t)
+        loss = criterion(y_pred.to(dtype=torch.float32), y_train_float)
         
         loss.backward()
         optimizer.step()
         
         # Validation
-        if X_val is not None:
+        if X_val is not None and X_val_scaled is not None and y_val_float is not None:
             model.eval()
             with torch.no_grad():
                 y_val_pred = model(X_val_scaled)
-                val_loss = criterion(y_val_pred, y_val_t).item()
+                val_loss = criterion(y_val_pred.to(dtype=torch.float32), y_val_float).item()
             
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -375,7 +392,7 @@ def train_classification_probe(X_train, y_train, X_val, y_val, temp_to_class, de
     """Train linear classification probe."""
     input_dim = X_train.shape[1]
     num_classes = len(temp_to_class)
-    model = ClassificationProbe(input_dim, num_classes).to(device)
+    model = ClassificationProbe(input_dim, num_classes).to(device=device, dtype=torch.bfloat16)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss()
     
@@ -383,18 +400,18 @@ def train_classification_probe(X_train, y_train, X_val, y_val, temp_to_class, de
     X_mean = X_train.mean(dim=0, keepdim=True)
     X_std = X_train.std(dim=0, keepdim=True) + 1e-8
     
-    X_train_scaled = (X_train - X_mean) / X_std
+    X_train_scaled = (X_train - X_mean.to(device=X_train.device, dtype=X_train.dtype)) / X_std.to(device=X_train.device, dtype=X_train.dtype)
     if X_train_scaled.device != device:
-        X_train_scaled = X_train_scaled.to(device, non_blocking=True)
+        X_train_scaled = X_train_scaled.to(device, dtype=torch.bfloat16, non_blocking=True)
     
     # Convert temps to class labels (handle both CPU and GPU tensors)
     y_train_cpu = y_train.cpu() if y_train.is_cuda else y_train
     y_train_classes = torch.tensor([temp_to_class[y.item()] for y in y_train_cpu], dtype=torch.long).to(device)
     
     if X_val is not None:
-        X_val_scaled = (X_val - X_mean) / X_std
+        X_val_scaled = (X_val - X_mean.to(device=X_val.device, dtype=X_val.dtype)) / X_std.to(device=X_val.device, dtype=X_val.dtype)
         if X_val_scaled.device != device:
-            X_val_scaled = X_val_scaled.to(device, non_blocking=True)
+            X_val_scaled = X_val_scaled.to(device, dtype=torch.bfloat16, non_blocking=True)
         y_val_cpu = y_val.cpu() if y_val.is_cuda else y_val
         y_val_classes = torch.tensor([temp_to_class[y.item()] for y in y_val_cpu], dtype=torch.long).to(device)
     
@@ -407,7 +424,7 @@ def train_classification_probe(X_train, y_train, X_val, y_val, temp_to_class, de
         optimizer.zero_grad()
         
         logits = model(X_train_scaled)
-        loss = criterion(logits, y_train_classes)
+        loss = criterion(logits.to(dtype=torch.float32), y_train_classes)
         
         loss.backward()
         optimizer.step()
@@ -417,7 +434,7 @@ def train_classification_probe(X_train, y_train, X_val, y_val, temp_to_class, de
             model.eval()
             with torch.no_grad():
                 logits_val = model(X_val_scaled)
-                val_loss = criterion(logits_val, y_val_classes).item()
+                val_loss = criterion(logits_val.to(dtype=torch.float32), y_val_classes).item()
             
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -442,15 +459,16 @@ def evaluate_regression(model, X, y, X_mean, X_std, device):
     model.eval()
     
     # Move X to device for model inference if needed
-    X_scaled = ((X - X_mean) / X_std)
+    X_scaled = (X - X_mean.to(device=X.device, dtype=X.dtype)) / X_std.to(device=X.device, dtype=X.dtype)
     if X_scaled.device != device:
-        X_scaled = X_scaled.to(device)
+        X_scaled = X_scaled.to(device, dtype=torch.bfloat16)
     
     with torch.no_grad():
-        y_pred = model(X_scaled).cpu().numpy()
+        y_pred = model(X_scaled).to(dtype=torch.float32).cpu().numpy()
     
     # Handle both CPU and CUDA tensors
-    y_np = y.cpu().numpy() if y.is_cuda else y.numpy()
+    y_cpu = y.detach().cpu() if y.is_cuda else y
+    y_np = y_cpu.to(dtype=torch.float32).numpy()
     
     mse = np.mean((y_np - y_pred) ** 2)
     rmse = np.sqrt(mse)
@@ -466,12 +484,12 @@ def evaluate_classification(model, X, y, temp_to_class, class_to_temp, X_mean, X
     model.eval()
     
     # Move X to device for model inference if needed
-    X_scaled = ((X - X_mean) / X_std)
+    X_scaled = (X - X_mean.to(device=X.device, dtype=X.dtype)) / X_std.to(device=X.device, dtype=X.dtype)
     if X_scaled.device != device:
-        X_scaled = X_scaled.to(device)
+        X_scaled = X_scaled.to(device, dtype=torch.bfloat16)
     
     with torch.no_grad():
-        logits = model(X_scaled)
+        logits = model(X_scaled).to(dtype=torch.float32)
         y_pred_classes = logits.argmax(dim=1).cpu().numpy()
     
     # Handle both CPU and CUDA tensors
@@ -631,8 +649,8 @@ def main():
         reg_model_path = output_dir / 'models' / f'regression_layer_{layer_idx}.pt'
         torch.save({
             'model_state_dict': reg_model.state_dict(),
-            'X_mean': reg_mean.cpu(),
-            'X_std': reg_std.cpu(),
+            'X_mean': reg_mean.detach().cpu().to(torch.float32),
+            'X_std': reg_std.detach().cpu().to(torch.float32),
             'layer': layer_idx,
             'train_rmse': train_rmse,
             'test_rmse': test_rmse,
@@ -643,8 +661,8 @@ def main():
         clf_model_path = output_dir / 'models' / f'classification_layer_{layer_idx}.pt'
         torch.save({
             'model_state_dict': clf_model.state_dict(),
-            'X_mean': clf_mean.cpu(),
-            'X_std': clf_std.cpu(),
+            'X_mean': clf_mean.detach().cpu().to(torch.float32),
+            'X_std': clf_std.detach().cpu().to(torch.float32),
             'layer': layer_idx,
             'train_acc': train_acc,
             'test_acc': test_acc,

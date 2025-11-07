@@ -20,3 +20,4 @@ pandas
 numpy
 torch
 hf_transfer
+seaborn

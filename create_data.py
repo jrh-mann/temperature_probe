@@ -296,7 +296,7 @@ def extract_activations_from_rollouts(
             print(f"    Extracting activations...")
             print(f"    Saving to {output_dir}")
             try:
-                store_activations(model, prompts, str(output_dir))
+                store_activations(model, prompts, str(output_dir), layer_indices=layer_indices)
                 # Verify files were created
                 saved_files = list(output_dir.glob("*.pt"))
                 if saved_files:
@@ -329,4 +329,5 @@ if __name__ == "__main__":
         model_path="/workspace/Qwen3-0.6B",
         device="cuda",
         layer_indices=[i for i in [0, 3, 6, 9, 12, 15, 18, 21, 24, 27]],
+        n_samples=500,
     )
