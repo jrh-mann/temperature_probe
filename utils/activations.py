@@ -23,88 +23,165 @@ def get_start_of_sublist(tokenizer, prompt):
             return i + 3
     raise ValueError("Not found")
 
-def store_activations(model, prompts, output_dir, layer_indices=None):
+def store_activations(
+    model,
+    prompts,
+    output_dir,
+    layer_indices=None,
+    batch_size=4,
+    save_workers=4,
+    save_dtype=torch.bfloat16,
+):
+    """Trace `prompts` through `model` and persist per-prompt layer activations.
+
+    Args:
+        model: nnsight LanguageModel instance.
+        prompts: Iterable of formatted prompt strings.
+        output_dir: Directory path to write activation tensors and metadata.
+        layer_indices: Optional iterable of layer indices to capture. Defaults to all layers.
+        batch_size: Number of prompts to run per forward pass.
+        save_workers: Number of background threads used to write tensors to disk.
+        save_dtype: If provided, tensors are cast to this dtype before saving (default: bfloat16).
+    """
     # Convert to string if Path object
     output_dir = str(output_dir)
-    
+
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
+
+    if save_workers < 1:
+        raise ValueError("save_workers must be at least 1")
+
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
     torch.save(prompts, os.path.join(output_dir, "prompts.pt"))
 
-    with torch.no_grad():
-        for index, prompt in enumerate(tqdm(prompts, desc="Extracting activations")):
-            residual_stream = []
-            #start_of_response = get_start_of_sublist(model.tokenizer, prompt)
-            try:
-                with model.trace(prompt) as tracer:
-                    # Save activations from each layer
-
-                    if layer_indices is None:
-                        layers = model.model.layers
-                    else:
-                        layers = [model.model.layers[i] for i in layer_indices]
-                    for layer in layers:
-                        residual_stream.append(layer.output.save())
-                    # Execute the trace by accessing the output
-                
-                # After trace execution, extract the saved values
-                # In nnsight, saved proxies are populated after execution
-                # The saved object should be the tensor itself after execution
-                # Original code used [0] indexing, so saved might return a tuple/list
-                acts_list = []
-                for saved in residual_stream:
-                    # Try different ways to access the saved tensor
+    def _extract_tensor(saved_value):
+        tensor = None
+        try:
+            if isinstance(saved_value, torch.Tensor):
+                tensor = saved_value
+            elif hasattr(saved_value, '__getitem__'):
+                try:
+                    tensor = saved_value[0]
+                except (IndexError, TypeError):
                     tensor = None
-                    try:
-                        # Try direct access first (most common case)
-                        if isinstance(saved, torch.Tensor):
-                            tensor = saved
-                        # Try [0] indexing (as in original code)
-                        elif hasattr(saved, '__getitem__'):
-                            try:
-                                tensor = saved[0]
-                            except (IndexError, TypeError):
-                                pass
-                        # Try .value attribute
-                        if tensor is None and hasattr(saved, 'value') and saved.value is not None:
-                            tensor = saved.value
-                        # Try .output attribute
-                        if tensor is None and hasattr(saved, 'output') and saved.output is not None:
-                            tensor = saved.output
-                        # If still None, try direct access
-                        if tensor is None:
-                            tensor = saved
-                        
-                        if tensor is not None and isinstance(tensor, torch.Tensor):
-                            acts_list.append(tensor)
-                        else:
-                            print(f"Warning: Could not extract tensor from saved value (type: {type(saved)})")
-                    except Exception as e:
-                        print(f"Warning: Could not extract saved value: {e}, trying direct access")
-                        # Last resort: try direct access
-                        if isinstance(saved, torch.Tensor):
-                            acts_list.append(saved)
-                
-                if not acts_list:
-                    raise ValueError("No activations were extracted from any layer")
-                
-                acts = torch.stack(acts_list)
-                #indexed_acts = acts[:,start_of_response:]
-                cpuacts = acts.cpu()
-                save_path = os.path.join(output_dir, f"{index}.pt")
-                torch.save(cpuacts, save_path)
+            if tensor is None and hasattr(saved_value, 'value') and saved_value.value is not None:
+                tensor = saved_value.value
+            if tensor is None and hasattr(saved_value, 'output') and saved_value.output is not None:
+                tensor = saved_value.output
+            if tensor is None and isinstance(saved_value, torch.Tensor):
+                tensor = saved_value
+        except Exception as e:
+            print(f"Warning: Could not extract saved value: {e}, trying direct access")
+            if isinstance(saved_value, torch.Tensor):
+                tensor = saved_value
+        if tensor is not None and not isinstance(tensor, torch.Tensor):
+            print(f"Warning: Could not extract tensor from saved value (type: {type(saved_value)})")
+            tensor = None
+        return tensor
 
-                del residual_stream
-                del acts_list
-                del acts
-                del cpuacts
-                torch.cuda.empty_cache()
-            except Exception as e:
-                print(f"\nError processing prompt {index}: {e}")
-                import traceback
-                traceback.print_exc()
-                raise
+    save_executor = ThreadPoolExecutor(max_workers=save_workers)
+    pending_saves = []
+
+    def _flush_pending(force=False):
+        if not pending_saves:
+            return
+        if force:
+            while pending_saves:
+                future = pending_saves.pop(0)
+                future.result()
+        elif len(pending_saves) >= save_workers * 2:
+            future = pending_saves.pop(0)
+            future.result()
+
+    prompts = list(prompts)
+
+    try:
+        with torch.no_grad():
+            for batch_start in tqdm(range(0, len(prompts), batch_size), desc="Extracting activations"):
+                batch_prompts = prompts[batch_start: batch_start + batch_size]
+                residual_stream = []
+
+                try:
+                    trace_input = batch_prompts if len(batch_prompts) > 1 else batch_prompts[0]
+                    with model.trace(trace_input) as tracer:
+                        if layer_indices is None:
+                            layers = model.model.layers
+                        else:
+                            layers = [model.model.layers[i] for i in layer_indices]
+                        for layer in layers:
+                            residual_stream.append(layer.output.save())
+
+                    acts_list = []
+                    for saved in residual_stream:
+                        tensor = _extract_tensor(saved)
+                        if tensor is not None:
+                            acts_list.append(tensor)
+
+                    if not acts_list:
+                        raise ValueError("No activations were extracted from any layer")
+
+                    acts = torch.stack(acts_list)
+                    cpuacts = acts.cpu()
+
+                    if cpuacts.ndim == 4:
+                        batch_dim = cpuacts.shape[1]
+
+                        def _per_prompt_generator():
+                            for idx in range(batch_dim):
+                                yield idx, cpuacts[:, idx].contiguous().clone()
+
+                        per_prompt_iter = _per_prompt_generator()
+                    elif cpuacts.ndim == 3:
+                        batch_dim = 1
+
+                        def _single_prompt_generator():
+                            yield 0, cpuacts.contiguous().clone()
+
+                        per_prompt_iter = _single_prompt_generator()
+                    else:
+                        raise ValueError(f"Unexpected activation shape: {cpuacts.shape}")
+
+                    if batch_dim != len(batch_prompts):
+                        print(
+                            f"Warning: Batch size mismatch (expected {len(batch_prompts)}, got {batch_dim})."
+                        )
+
+                    for idx_within_batch, tensor_to_save in per_prompt_iter:
+                        if save_dtype is not None and tensor_to_save.dtype != save_dtype:
+                            tensor_to_save = tensor_to_save.to(dtype=save_dtype)
+                        prompt_index = batch_start + idx_within_batch
+                        save_path = os.path.join(output_dir, f"{prompt_index}.pt")
+                        future = save_executor.submit(torch.save, tensor_to_save, save_path)
+                        pending_saves.append(future)
+                        _flush_pending()
+                        del tensor_to_save
+
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception as e:
+                    print(f"\nError processing prompts {batch_start}:{batch_start + len(batch_prompts)}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    raise
+                finally:
+                    residual_stream.clear()
+                    acts_list = []
+                    if 'acts' in locals():
+                        del acts
+                    if 'cpuacts' in locals():
+                        del cpuacts
+                    if 'per_prompt_iter' in locals():
+                        del per_prompt_iter
+                    if 'trace_input' in locals():
+                        del trace_input
+                    _flush_pending()
+                    gc.collect()
+    finally:
+        _flush_pending(force=True)
+        save_executor.shutdown(wait=True)
 
 def load_activations(output_dir, layer_idx=None, layer_indices=None, token_every_n=1, max_workers=4, max_files=None):
     """

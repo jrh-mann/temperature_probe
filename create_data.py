@@ -317,16 +317,16 @@ def extract_activations_from_rollouts(
 
 if __name__ == "__main__":
     # Example usage
-    generate_rollouts_from_harmless(
+    '''generate_rollouts_from_harmless(
         model_name="Qwen3-0.6B",
         temperatures=[0.25, 0.5, 0.75, 1.0, 1.25, 1.5],
         num_samples=1000,
         max_tokens=10000
-    )
+    )'''
     extract_activations_from_rollouts(
         rollout_dir="rollouts/Qwen3-0.6B",
         activations_dir="/workspace/activations",
-        model_path="/workspace",
+        model_path="/workspace/Qwen3-0.6B",
         device="cuda",
-        layer_indices=[i for i in range(25, 33)],
+        layer_indices=[i for i in [0, 3, 6, 9, 12, 15, 18, 21, 24, 27]],
     )
