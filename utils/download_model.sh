@@ -3,15 +3,25 @@
 # Download gpt-oss-20b model from HuggingFace
 # This script downloads the model to a local directory for use with vLLM
 
-# Activate virtual environment
-source /root/counterfactual_steering/.venv/bin/activate
+# Activate virtual environment if it exists
+if [ -f /root/temperature_probe/.venv/bin/activate ]; then
+    source /root/temperature_probe/.venv/bin/activate
+elif [ -f .venv/bin/activate ]; then
+    source .venv/bin/activate
+fi
 
 # Default configuration
 MODEL_NAME="${1:-${MODEL_NAME:-openai/gpt-oss-20b}}"
-LOCAL_DIR="${LOCAL_DIR:-/workspace}"
+
+# Extract model name from HuggingFace identifier (e.g., "openai/gpt-oss-20b" -> "gpt-oss-20b")
+MODEL_FOLDER_NAME=$(echo "$MODEL_NAME" | sed 's|.*/||' | sed 's|[^a-zA-Z0-9._-]|_|g')
+
+# Use model-specific directory in /workspace
+LOCAL_DIR="${LOCAL_DIR:-/workspace/${MODEL_FOLDER_NAME}}"
 CACHE_DIR="${CACHE_DIR:-/workspace/.cache/huggingface}"
 
 echo "Downloading model: $MODEL_NAME"
+echo "Model folder name: $MODEL_FOLDER_NAME"
 echo "Local directory: $LOCAL_DIR"
 echo "Cache directory: $CACHE_DIR"
 echo ""
@@ -69,11 +79,15 @@ DOWNLOAD_STATUS=$?
 
 if [ $DOWNLOAD_STATUS -eq 0 ]; then
     echo ""
-    echo "Local path: $LOCAL_DIR"
+    echo "✓ Model successfully downloaded!"
+    echo "  Local path: $LOCAL_DIR"
     echo ""
-    echo "To use this model, set MODEL_PATH in start_vllm_server.sh:"
+    echo "To use this model with vLLM:"
     echo "  export MODEL_PATH=\"$LOCAL_DIR\""
-    echo "  ./start_vllm_server.sh"
+    echo "  bash utils/start_vllm_server.sh"
+    echo ""
+    echo "Or directly:"
+    echo "  MODEL_PATH=\"$LOCAL_DIR\" bash utils/start_vllm_server.sh"
 else
     echo ""
     echo "✗ Download failed. Please check:"

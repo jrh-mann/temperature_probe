@@ -12,3 +12,11 @@ vllm>=0.3.0
 datasets
 huggingface_hub
 vllm
+matplotlib
+ipykernel
+nnsight
+scikit-learn
+pandas
+numpy
+torch
+hf_transfer

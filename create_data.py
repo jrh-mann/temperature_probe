@@ -155,7 +155,9 @@ def extract_activations_from_rollouts(
     rollout_dir: str = "rollouts",
     activations_dir: str = "/workspace/activations",
     model_path: str = "/workspace",
-    device: str = "cuda"
+    device: str = "cuda",
+    n_samples: int = None,
+    layer_indices: List[int] = None,
 ) -> None:
     """
     Extract activations from all rollouts and save them organized by model and temperature.
@@ -253,12 +255,18 @@ def extract_activations_from_rollouts(
                 continue
             
             print(f"    Found {len(rollouts)} rollouts")
+
+            # Randomly sample 100 rollouts
+            if n_samples:
+                rollouts = rollouts[:n_samples]
+                print(f"    Reduced to first {n_samples}")
             
             # Extract instructions and format prompts
             print(f"    Formatting prompts...")
             prompts = []
             for rollout in rollouts:
                 instruction = rollout.get("instruction", "")
+                response = rollout.get("completion", "")
                 if not instruction:
                     print(f"    Warning: Empty instruction found in rollout, skipping")
                     continue
@@ -266,9 +274,8 @@ def extract_activations_from_rollouts(
                 # Format prompt using chat template
                 try:
                     formatted_prompt = model.tokenizer.apply_chat_template(
-                        [{"role": "user", "content": instruction}],
+                        [{"role": "user", "content": instruction}, {"role": "assistant", "content": response}],
                         tokenize=False,
-                        add_generation_prompt=True
                     )
                     prompts.append(formatted_prompt)
                 except Exception as e:
@@ -310,15 +317,16 @@ def extract_activations_from_rollouts(
 
 if __name__ == "__main__":
     # Example usage
-    '''generate_rollouts_from_harmless(
+    generate_rollouts_from_harmless(
         model_name="Qwen3-0.6B",
-        temperatures=[0.0, 0.5, 1.0, 1.5],
-        num_samples=30,
+        temperatures=[0.25, 0.5, 0.75, 1.0, 1.25, 1.5],
+        num_samples=1000,
         max_tokens=10000
-    )'''
+    )
     extract_activations_from_rollouts(
         rollout_dir="rollouts/Qwen3-0.6B",
         activations_dir="/workspace/activations",
         model_path="/workspace",
-        device="cuda"
+        device="cuda",
+        layer_indices=[i for i in range(25, 33)],
     )
