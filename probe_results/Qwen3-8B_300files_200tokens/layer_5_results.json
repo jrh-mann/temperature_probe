@@ -1,0 +1,79 @@
+{
+  "layer": 5,
+  "regression": {
+    "train_rmse": 0.45082423090934753,
+    "train_r2": -0.11493027210235596,
+    "test_rmse": 0.45986616611480713,
+    "test_r2": -0.1601017713546753
+  },
+  "classification": {
+    "train_accuracy": 0.24994907407407407,
+    "test_accuracy": 0.19104166666666667,
+    "confusion_matrix": [
+      [
+        1269,
+        6438,
+        1181,
+        951,
+        1063,
+        1098
+      ],
+      [
+        1054,
+        6993,
+        1005,
+        889,
+        957,
+        1102
+      ],
+      [
+        1151,
+        6619,
+        1061,
+        933,
+        1051,
+        1185
+      ],
+      [
+        1013,
+        6442,
+        1061,
+        1001,
+        1115,
+        1368
+      ],
+      [
+        852,
+        6655,
+        938,
+        903,
+        1090,
+        1562
+      ],
+      [
+        851,
+        5840,
+        844,
+        937,
+        1187,
+        2341
+      ]
+    ]
+  },
+  "config": {
+    "activations_dir": "/workspace/activations/Qwen3-8B",
+    "layers": "0,1,2,3,4,5,6,7",
+    "max_files_per_temp": 300,
+    "test_size": 0.2,
+    "val_size": 0.2,
+    "device": "cuda",
+    "epochs": 1000,
+    "lr": 0.001,
+    "patience": 50,
+    "output_dir": "probe_results",
+    "preload_to_gpu": true,
+    "files_per_batch": 64,
+    "chunk_size": 64,
+    "sample_tokens_per_sequence": 200
+  }
+}

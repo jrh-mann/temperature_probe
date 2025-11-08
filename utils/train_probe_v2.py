@@ -21,6 +21,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, confusion_matrix
 import matplotlib.pyplot as plt
 import seaborn as sns
+from transformers import AutoTokenizer
 
 # Try to import memory profiling tools
 try:
@@ -70,7 +71,76 @@ class ClassificationProbe(nn.Module):
         return self.linear(x)
 
 
-def load_file_activations(file_path, layer_indices, sample_tokens_per_sequence=50):
+def compute_assistant_offset(prompt, tokenizer, assistant_marker="<|im_start|>assistant"):
+    """
+    Compute the token offset marking the beginning of the assistant response.
+    Returns None if the marker cannot be found.
+    """
+    if not isinstance(prompt, str):
+        return None
+
+    idx = prompt.find(assistant_marker)
+    if idx == -1:
+        return None
+
+    start_idx = idx + len(assistant_marker)
+    while start_idx < len(prompt) and prompt[start_idx] in ("\n", " ", "\t"):
+        start_idx += 1
+
+    prefix = prompt[:start_idx]
+    tokenized = tokenizer(
+        prefix,
+        add_special_tokens=False,
+        return_attention_mask=False,
+        return_tensors="pt",
+    )
+    return int(tokenized.input_ids.shape[-1])
+
+
+def infer_tokenizer_from_activations(activations_dir: str) -> AutoTokenizer:
+    """
+    Infer and load the tokenizer used to create prompts for a given activations directory.
+    Uses directory naming conventions to locate a matching model checkpoint.
+    """
+    activations_path = Path(activations_dir).resolve()
+    base_name = activations_path.name
+
+    candidate_refs = []
+
+    if activations_path.parent.parent:
+        candidate_refs.append(activations_path.parent.parent / base_name)
+    if activations_path.parent:
+        candidate_refs.append(activations_path.parent / base_name)
+    candidate_refs.append(activations_path)
+    candidate_refs.append(base_name)
+
+    tried = []
+    last_exc = None
+
+    for candidate in candidate_refs:
+        if isinstance(candidate, Path):
+            candidate = candidate.resolve()
+            if not candidate.exists():
+                continue
+            load_ref = str(candidate)
+        else:
+            load_ref = candidate
+
+        try:
+            print(f"Attempting to load tokenizer from '{load_ref}'")
+            return AutoTokenizer.from_pretrained(load_ref, trust_remote_code=True)
+        except Exception as exc:
+            tried.append(load_ref)
+            last_exc = exc
+
+    tried_str = ", ".join(tried) if tried else "no candidates"
+    raise RuntimeError(
+        f"Unable to infer tokenizer for activations in '{activations_dir}'. "
+        f"Tried: {tried_str}. Last error: {last_exc}"
+    )
+
+
+def load_file_activations(file_path, layer_indices, sample_tokens_per_sequence=50, prompt_offsets=None):
     """
     Load activations from a single file for specified layers.
     
@@ -88,6 +158,15 @@ def load_file_activations(file_path, layer_indices, sample_tokens_per_sequence=5
     # acts shape: (num_layers, 1, seq_len, hidden_dim)
     
     result = {}
+    try:
+        prompt_index = int(Path(file_path).stem)
+    except ValueError:
+        prompt_index = None
+
+    assistant_offset = None
+    if prompt_offsets is not None and prompt_index is not None:
+        assistant_offset = prompt_offsets.get(prompt_index)
+
     for layer_idx in layer_indices:
         if layer_idx >= acts.shape[0]:
             continue
@@ -96,6 +175,11 @@ def load_file_activations(file_path, layer_indices, sample_tokens_per_sequence=5
         layer_acts = acts[layer_idx].squeeze(0)
         if layer_acts.dtype != torch.float32:
             layer_acts = layer_acts.to(dtype=torch.float32)
+
+        if assistant_offset is not None and assistant_offset > 0:
+            if assistant_offset >= layer_acts.shape[0]:
+                continue
+            layer_acts = layer_acts[assistant_offset:]
         
         seq_len = layer_acts.shape[0]
         if sample_tokens_per_sequence and sample_tokens_per_sequence > 0 and seq_len > sample_tokens_per_sequence:
@@ -128,6 +212,7 @@ def load_data_by_files(
     preload_device='cpu',
     files_per_batch=4,
     chunk_size=8,
+    tokenizer=None,
 ):
     """
     Load activations and split by files (not tokens) to avoid data leakage.
@@ -140,6 +225,7 @@ def load_data_by_files(
         files_per_batch: Number of activation files to process before forcing a cleanup step.
         chunk_size: Number of files to accumulate per layer before concatenating into a larger tensor.
         sample_tokens_per_sequence: Max tokens to sample per file/sequence (uniform spacing). Use <=0 to keep all tokens.
+        tokenizer: Hugging Face tokenizer to align tokens with assistant spans (required for slicing user prefixes).
     
     Returns:
         Dictionary mapping layer_idx -> (train_data, val_data, test_data)
@@ -170,6 +256,7 @@ def load_data_by_files(
     
     # Collect files per temperature
     files_by_temp = {}
+    prompt_offsets_by_temp = {}
     for temp_dir in temp_dirs:
         temp = float(temp_dir.name.replace('temperature_', ''))
         act_files = sorted([f for f in os.listdir(temp_dir) if f.endswith('.pt') and f != 'prompts.pt'])
@@ -180,6 +267,14 @@ def load_data_by_files(
         
         files_by_temp[temp] = [(temp_dir / f) for f in act_files]
         print(f"  Temperature {temp}: {len(files_by_temp[temp])} files")
+
+        prompts_path = temp_dir / 'prompts.pt'
+        offsets = {}
+        if tokenizer is not None and prompts_path.exists():
+            prompts = torch.load(prompts_path, map_location='cpu')
+            for idx, prompt in enumerate(prompts):
+                offsets[idx] = compute_assistant_offset(prompt, tokenizer)
+        prompt_offsets_by_temp[temp] = offsets
     
     # Split files into train/val/test for each temperature (stratified by temperature)
     train_files = []
@@ -189,7 +284,7 @@ def load_data_by_files(
     for temp, files in files_by_temp.items():
         if len(files) < 3:
             print(f"Warning: Only {len(files)} files for temp {temp}, using all for training")
-            train_files.extend([(f, temp) for f in files])
+            train_files.extend([(f, temp, prompt_offsets_by_temp[temp]) for f in files])
             continue
         
         # First split: train+val vs test
@@ -206,9 +301,9 @@ def load_data_by_files(
             files_train = files_train_val
             files_val = []
         
-        train_files.extend([(f, temp) for f in files_train])
-        val_files.extend([(f, temp) for f in files_val])
-        test_files.extend([(f, temp) for f in files_test])
+        train_files.extend([(f, temp, prompt_offsets_by_temp[temp]) for f in files_train])
+        val_files.extend([(f, temp, prompt_offsets_by_temp[temp]) for f in files_val])
+        test_files.extend([(f, temp, prompt_offsets_by_temp[temp]) for f in files_test])
     
     print(f"\nFile splits:")
     print(f"  Train: {len(train_files)} files")
@@ -274,11 +369,12 @@ def load_data_by_files(
         total_steps = (len(file_list) + files_per_batch - 1) // files_per_batch
         for batch_start in tqdm(range(0, len(file_list), files_per_batch), desc=f"Loading {split_name}", total=total_steps):
             batch = file_list[batch_start:batch_start + files_per_batch]
-            for file_path, temp in batch:
+            for file_path, temp, prompt_offsets in batch:
                 acts_dict = load_file_activations(
                     file_path,
                     layer_indices,
                     sample_tokens_per_sequence=sample_tokens_per_sequence,
+                    prompt_offsets=prompt_offsets,
                 )
                 
                 for layer_idx, acts in acts_dict.items():
@@ -721,6 +817,8 @@ def main():
     # Determine preload device
     preload_device = 'cuda' if args.preload_to_gpu and torch.cuda.is_available() else 'cpu'
     
+    tokenizer = infer_tokenizer_from_activations(args.activations_dir)
+
     data_by_layer, temp_to_class, class_to_temp = load_data_by_files(
         args.activations_dir,
         layer_indices,
@@ -731,6 +829,7 @@ def main():
         preload_device=preload_device,
         files_per_batch=args.files_per_batch,
         chunk_size=args.chunk_size,
+        tokenizer=tokenizer,
     )
     
     # Debug: class distribution before training

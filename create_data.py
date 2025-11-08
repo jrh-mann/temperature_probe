@@ -296,7 +296,7 @@ def extract_activations_from_rollouts(
             print(f"    Extracting activations...")
             print(f"    Saving to {output_dir}")
             try:
-                store_activations(model, prompts, str(output_dir), layer_indices=layer_indices)
+                store_activations(model, prompts, str(output_dir), layer_indices=layer_indices, batch_size=8, save_workers=8)
                 # Verify files were created
                 saved_files = list(output_dir.glob("*.pt"))
                 if saved_files:
@@ -318,16 +318,16 @@ def extract_activations_from_rollouts(
 if __name__ == "__main__":
     # Example usage
     '''generate_rollouts_from_harmless(
-        model_name="Qwen3-0.6B",
+        model_name="Qwen3-8B",
         temperatures=[0.25, 0.5, 0.75, 1.0, 1.25, 1.5],
-        num_samples=1000,
+        num_samples=500,
         max_tokens=10000
     )'''
     extract_activations_from_rollouts(
-        rollout_dir="rollouts/Qwen3-0.6B",
+        rollout_dir="rollouts/Qwen3-8B",
         activations_dir="/workspace/activations",
-        model_path="/workspace/Qwen3-0.6B",
+        model_path="/workspace/Qwen3-8B",
         device="cuda",
-        layer_indices=[i for i in [0, 3, 6, 9, 12, 15, 18, 21, 24, 27]],
-        n_samples=500,
+        layer_indices=[i for i in [0, 5, 10, 15, 20, 25, 30, 35]],
+        n_samples=300,
     )
