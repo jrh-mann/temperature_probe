@@ -94,7 +94,7 @@ def print_summary(experiments):
         print(f"\n{exp_name}:")
         print(f"  Config:")
         print(f"    - Max files per temp: {config.get('max_files_per_temp', 'all')}")
-        print(f"    - Token sampling: every {config['token_every_n']}")
+        print(f"    - Sample tokens per sequence: {config.get('sample_tokens_per_sequence', 'unknown')}")
         print(f"    - Layers: {len(results)}")
         
         # Find best layers

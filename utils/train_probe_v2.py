@@ -70,22 +70,21 @@ class ClassificationProbe(nn.Module):
         return self.linear(x)
 
 
-def load_file_activations(file_path, layer_indices, token_every_n=1):
+def load_file_activations(file_path, layer_indices, sample_tokens_per_sequence=50):
     """
     Load activations from a single file for specified layers.
     
     Args:
         file_path: Path to .pt file
         layer_indices: List of layer indices to extract
-        token_every_n: Sample every nth token
+        sample_tokens_per_sequence: If > 0, uniformly sample up to this many tokens per sequence
     
     Returns:
         Dict mapping layer_idx -> tensor of shape (seq_len, hidden_dim)
     """
     acts = torch.load(file_path, map_location='cpu')
-    # Ensure activations are in bfloat16 for consistency
-    if isinstance(acts, torch.Tensor) and acts.dtype != torch.bfloat16:
-        acts = acts.to(dtype=torch.bfloat16)
+    if isinstance(acts, torch.Tensor) and acts.dtype != torch.float32:
+        acts = acts.to(dtype=torch.float32)
     # acts shape: (num_layers, 1, seq_len, hidden_dim)
     
     result = {}
@@ -95,12 +94,21 @@ def load_file_activations(file_path, layer_indices, token_every_n=1):
         
         # Extract layer and remove batch dim: (seq_len, hidden_dim)
         layer_acts = acts[layer_idx].squeeze(0)
-        if layer_acts.dtype != torch.bfloat16:
-            layer_acts = layer_acts.to(dtype=torch.bfloat16)
+        if layer_acts.dtype != torch.float32:
+            layer_acts = layer_acts.to(dtype=torch.float32)
         
-        # Sample tokens
-        if token_every_n > 1:
-            layer_acts = layer_acts[::token_every_n]
+        seq_len = layer_acts.shape[0]
+        if sample_tokens_per_sequence and sample_tokens_per_sequence > 0 and seq_len > sample_tokens_per_sequence:
+            indices = torch.linspace(
+                0,
+                seq_len - 1,
+                steps=sample_tokens_per_sequence,
+                dtype=torch.float32
+            ).round().to(dtype=torch.long)
+            indices = torch.unique(indices, sorted=True)
+            if indices.numel() > sample_tokens_per_sequence:
+                indices = indices[:sample_tokens_per_sequence]
+            layer_acts = layer_acts[indices]
         
         result[layer_idx] = layer_acts
     
@@ -110,7 +118,17 @@ def load_file_activations(file_path, layer_indices, token_every_n=1):
     return result
 
 
-def load_data_by_files(activations_dir, layer_indices, token_every_n=1, max_files_per_temp=None, test_size=0.2, val_size=0.2, preload_device='cpu'):
+def load_data_by_files(
+    activations_dir,
+    layer_indices,
+    sample_tokens_per_sequence=50,
+    max_files_per_temp=None,
+    test_size=0.1,
+    val_size=0.1,
+    preload_device='cpu',
+    files_per_batch=4,
+    chunk_size=8,
+):
     """
     Load activations and split by files (not tokens) to avoid data leakage.
     Can load multiple layers at once for efficiency.
@@ -119,6 +137,9 @@ def load_data_by_files(activations_dir, layer_indices, token_every_n=1, max_file
         layer_indices: List of layer indices to load (e.g., [0, 1, 2, 3])
         preload_device: Device to preload data to ('cpu', 'cuda', or 'auto')
                        'auto' will use GPU if available and there's space
+        files_per_batch: Number of activation files to process before forcing a cleanup step.
+        chunk_size: Number of files to accumulate per layer before concatenating into a larger tensor.
+        sample_tokens_per_sequence: Max tokens to sample per file/sequence (uniform spacing). Use <=0 to keep all tokens.
     
     Returns:
         Dictionary mapping layer_idx -> (train_data, val_data, test_data)
@@ -126,6 +147,11 @@ def load_data_by_files(activations_dir, layer_indices, token_every_n=1, max_file
         class_to_temp: Dict mapping class index to temperature
     """
     activations_dir = Path(activations_dir)
+    
+    if files_per_batch < 1:
+        raise ValueError("files_per_batch must be at least 1")
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be at least 1")
     
     # Find all temperature directories
     temp_dirs = sorted([d for d in activations_dir.iterdir() if d.is_dir() and d.name.startswith('temperature_')])
@@ -191,51 +217,125 @@ def load_data_by_files(activations_dir, layer_indices, token_every_n=1, max_file
     
     # Load activations for each split and each layer
     def load_split(file_list, split_name, move_to_device=None):
-        # Initialize storage for each layer
-        layer_data = {layer_idx: {'X_list': [], 'Y_list': []} for layer_idx in layer_indices}
+        layer_batches = {layer_idx: [] for layer_idx in layer_indices}
+        label_batches = {layer_idx: [] for layer_idx in layer_indices}
+        layer_chunks = {layer_idx: [] for layer_idx in layer_indices}
+        label_chunks = {layer_idx: [] for layer_idx in layer_indices}
+        layer_chunk_counts = {layer_idx: 0 for layer_idx in layer_indices}
         
-        for file_path, temp in tqdm(file_list, desc=f"Loading {split_name}"):
-            # Load all requested layers from this file at once
-            acts_dict = load_file_activations(file_path, layer_indices, token_every_n)
+        target_device = move_to_device
+        gpu_enabled = target_device is not None and target_device.type == 'cuda'
+        
+        def move_chunks_to_cpu():
+            for idx in layer_indices:
+                if layer_chunks[idx]:
+                    layer_chunks[idx] = [chunk.to('cpu', dtype=torch.float32) for chunk in layer_chunks[idx]]
+                if label_chunks[idx]:
+                    label_chunks[idx] = [labels.to('cpu', dtype=torch.float32) for labels in label_chunks[idx]]
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        def flush_layer(layer_idx):
+            nonlocal gpu_enabled
+            if not layer_chunks[layer_idx]:
+                return
             
-            # Store activations for each layer
-            for layer_idx, acts in acts_dict.items():
-                if acts is not None and acts.shape[0] > 0:
-                    layer_data[layer_idx]['X_list'].append(acts)
-                    layer_data[layer_idx]['Y_list'].append(torch.full((acts.shape[0],), temp, dtype=torch.float32))
+            X_chunk = torch.cat(layer_chunks[layer_idx], dim=0)
+            Y_chunk = torch.cat(label_chunks[layer_idx], dim=0)
+            layer_chunks[layer_idx].clear()
+            label_chunks[layer_idx].clear()
+            layer_chunk_counts[layer_idx] = 0
+            
+            if gpu_enabled:
+                try:
+                    X_chunk = X_chunk.to(target_device, dtype=torch.float32, non_blocking=True)
+                    Y_chunk = Y_chunk.to(target_device, non_blocking=True)
+                except RuntimeError as e:
+                    if "out of memory" in str(e):
+                        print("⚠️ GPU OOM while preloading, falling back to CPU for remaining data.")
+                        gpu_enabled = False
+                        move_chunks_to_cpu()
+                        X_chunk = X_chunk.to('cpu', dtype=torch.float32)
+                        Y_chunk = Y_chunk.to('cpu', dtype=torch.float32)
+                    else:
+                        raise
+            else:
+                X_chunk = X_chunk.to('cpu', dtype=torch.float32)
+                Y_chunk = Y_chunk.to('cpu', dtype=torch.float32)
+            
+            layer_batches[layer_idx].append(X_chunk)
+            label_batches[layer_idx].append(Y_chunk)
+            aggressive_gc()
         
-        # Concatenate for each layer and immediately move to GPU if requested
+        def flush_all_layers():
+            for idx in layer_indices:
+                flush_layer(idx)
+        
+        total_steps = (len(file_list) + files_per_batch - 1) // files_per_batch
+        for batch_start in tqdm(range(0, len(file_list), files_per_batch), desc=f"Loading {split_name}", total=total_steps):
+            batch = file_list[batch_start:batch_start + files_per_batch]
+            for file_path, temp in batch:
+                acts_dict = load_file_activations(
+                    file_path,
+                    layer_indices,
+                    sample_tokens_per_sequence=sample_tokens_per_sequence,
+                )
+                
+                for layer_idx, acts in acts_dict.items():
+                    if acts is None or acts.shape[0] == 0:
+                        continue
+                    
+                    if acts.dtype != torch.float32:
+                        acts = acts.to(dtype=torch.float32)
+                    
+                    if gpu_enabled:
+                        try:
+                            acts = acts.to(target_device, dtype=torch.float32, non_blocking=True)
+                        except RuntimeError as e:
+                            if "out of memory" in str(e):
+                                print("⚠️ GPU OOM while preloading, falling back to CPU for remaining data.")
+                                gpu_enabled = False
+                                move_chunks_to_cpu()
+                                acts = acts.to('cpu', dtype=torch.float32)
+                            else:
+                                raise
+                    else:
+                        acts = acts.to('cpu', dtype=torch.float32)
+                    
+                    labels = torch.full(
+                        (acts.shape[0],),
+                        temp,
+                        dtype=torch.float32,
+                        device=acts.device
+                    )
+                    
+                    layer_chunks[layer_idx].append(acts)
+                    label_chunks[layer_idx].append(labels)
+                    layer_chunk_counts[layer_idx] += 1
+                    
+                    if layer_chunk_counts[layer_idx] >= chunk_size:
+                        flush_layer(layer_idx)
+                
+                del acts_dict
+                aggressive_gc()
+            
+            aggressive_gc()
+        
+        flush_all_layers()
+        
         result = {}
         for layer_idx in layer_indices:
-            if not layer_data[layer_idx]['X_list']:
-                result[layer_idx] = (None, None)
-            else:
-                X = torch.cat(layer_data[layer_idx]['X_list'], dim=0)
-                Y = torch.cat(layer_data[layer_idx]['Y_list'], dim=0)
-                
-                # Immediately move to GPU and free CPU memory
-                if move_to_device is not None and move_to_device.type == 'cuda':
-                    try:
-                        X = X.to(move_to_device, dtype=torch.bfloat16, non_blocking=True)
-                        Y = Y.to(move_to_device, non_blocking=True)
-                        # Force cleanup of CPU tensors
-                        del layer_data[layer_idx]['X_list'][:]
-                        del layer_data[layer_idx]['Y_list'][:]
-                        aggressive_gc()
-                    except RuntimeError as e:
-                        if "out of memory" in str(e):
-                            # Keep on CPU if GPU OOM
-                            torch.cuda.empty_cache()
-                            move_to_device = None  # Stop trying to move to GPU
-                        else:
-                            raise
-                
-                if move_to_device is None and X.dtype != torch.bfloat16:
-                    X = X.to(dtype=torch.bfloat16)
+            if layer_batches[layer_idx]:
+                X = torch.cat(layer_batches[layer_idx], dim=0)
+                Y = torch.cat(label_batches[layer_idx], dim=0)
                 result[layer_idx] = (X, Y)
+            else:
+                result[layer_idx] = (None, None)
         
-        # Final cleanup
-        del layer_data
+        layer_batches.clear()
+        label_batches.clear()
+        layer_chunks.clear()
+        label_chunks.clear()
         aggressive_gc()
         
         return result
@@ -318,32 +418,29 @@ def load_data_by_files(activations_dir, layer_indices, token_every_n=1, max_file
 def train_regression_probe(X_train, y_train, X_val, y_val, device, epochs=1000, lr=0.001, patience=50):
     """Train linear regression probe."""
     input_dim = X_train.shape[1]
-    model = LinearProbe(input_dim).to(device=device, dtype=torch.bfloat16)
+    model = LinearProbe(input_dim).to(device=device, dtype=torch.float32)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
     
-    # Standardize (compute on data's current device)
-    X_mean = X_train.mean(dim=0, keepdim=True)
-    X_std = X_train.std(dim=0, keepdim=True) + 1e-8
+    # Standardize (compute in float32 for numerical stability)
+    X_train_float = X_train.to(dtype=torch.float32)
+    X_mean = X_train_float.mean(dim=0, keepdim=True)
+    X_std = X_train_float.std(dim=0, keepdim=True) + 1e-8
     
     # Standardize and ensure on correct device
     X_mean_bf16 = X_mean.to(device=X_train.device, dtype=X_train.dtype)
     X_std_bf16 = X_std.to(device=X_train.device, dtype=X_train.dtype)
     X_train_scaled = (X_train - X_mean_bf16) / X_std_bf16
-    if X_train_scaled.device != device:
-        X_train_scaled = X_train_scaled.to(device, dtype=torch.bfloat16, non_blocking=True)
+    X_train_scaled = X_train_scaled.to(device, dtype=torch.float32, non_blocking=True)
     
-    y_train_t = y_train if y_train.device == device else y_train.to(device, non_blocking=True)
-    y_train_t = y_train_t.to(dtype=torch.bfloat16)
-    y_train_float = y_train_t.to(dtype=torch.float32)
+    y_train_float = y_train if y_train.device == device else y_train.to(device, non_blocking=True)
+    y_train_float = y_train_float.to(dtype=torch.float32)
     
     if X_val is not None:
         X_val_scaled = (X_val - X_mean.to(device=X_val.device, dtype=X_val.dtype)) / X_std.to(device=X_val.device, dtype=X_val.dtype)
-        if X_val_scaled.device != device:
-            X_val_scaled = X_val_scaled.to(device, dtype=torch.bfloat16, non_blocking=True)
-        y_val_t = y_val if y_val.device == device else y_val.to(device, non_blocking=True)
-        y_val_t = y_val_t.to(dtype=torch.bfloat16)
-        y_val_float = y_val_t.to(dtype=torch.float32)
+        X_val_scaled = X_val_scaled.to(device, dtype=torch.float32, non_blocking=True)
+        y_val_float = y_val if y_val.device == device else y_val.to(device, non_blocking=True)
+        y_val_float = y_val_float.to(dtype=torch.float32)
     else:
         X_val_scaled = None
         y_val_t = None
@@ -358,6 +455,9 @@ def train_regression_probe(X_train, y_train, X_val, y_val, device, epochs=1000, 
         optimizer.zero_grad()
         
         y_pred = model(X_train_scaled)
+        if epoch == 0:
+            print("  Epoch 1 regression preds sample (first 5):")
+            print(y_pred[:5].detach().cpu())
         loss = criterion(y_pred.to(dtype=torch.float32), y_train_float)
         
         loss.backward()
@@ -368,6 +468,9 @@ def train_regression_probe(X_train, y_train, X_val, y_val, device, epochs=1000, 
             model.eval()
             with torch.no_grad():
                 y_val_pred = model(X_val_scaled)
+                if epoch == 0:
+                    print("  Epoch 1 regression val preds sample (first 5):")
+                    print(y_val_pred[:5].detach().cpu())
                 val_loss = criterion(y_val_pred.to(dtype=torch.float32), y_val_float).item()
             
             if val_loss < best_val_loss:
@@ -388,32 +491,42 @@ def train_regression_probe(X_train, y_train, X_val, y_val, device, epochs=1000, 
     return model, X_mean, X_std
 
 
-def train_classification_probe(X_train, y_train, X_val, y_val, temp_to_class, device, epochs=1000, lr=0.001, patience=50):
+def train_classification_probe(X_train, y_train, X_val, y_val, temp_to_class, class_to_temp, device, epochs=1000, lr=0.001, patience=50):
     """Train linear classification probe."""
     input_dim = X_train.shape[1]
     num_classes = len(temp_to_class)
-    model = ClassificationProbe(input_dim, num_classes).to(device=device, dtype=torch.bfloat16)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.CrossEntropyLoss()
+    model = ClassificationProbe(input_dim, num_classes).to(device=device, dtype=torch.float32)
     
-    # Standardize (compute on data's current device)
-    X_mean = X_train.mean(dim=0, keepdim=True)
-    X_std = X_train.std(dim=0, keepdim=True) + 1e-8
+    # Compute class weights to counter temperature imbalance
+    y_train_cpu = y_train.cpu() if y_train.is_cuda else y_train
+    y_train_classes_list = [temp_to_class[val.item()] for val in y_train_cpu]
+    class_counts = torch.bincount(torch.tensor(y_train_classes_list, dtype=torch.long), minlength=num_classes).float()
+    class_weights = class_counts.sum() / (class_counts + 1e-8)
+    class_weights = class_weights.to(device)
+    print("\n  Class counts (train):")
+    for idx, temp in class_to_temp.items():
+        print(f"    Class {idx} (temp {temp}): {int(class_counts[idx].item())} samples, weight={class_weights[idx].item():.4f}")
+    
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    
+    # Standardize (compute in float32 for numerical stability)
+    X_train_float = X_train.to(dtype=torch.float32)
+    X_mean = X_train_float.mean(dim=0, keepdim=True)
+    X_std = X_train_float.std(dim=0, keepdim=True) + 1e-8
     
     X_train_scaled = (X_train - X_mean.to(device=X_train.device, dtype=X_train.dtype)) / X_std.to(device=X_train.device, dtype=X_train.dtype)
-    if X_train_scaled.device != device:
-        X_train_scaled = X_train_scaled.to(device, dtype=torch.bfloat16, non_blocking=True)
+    X_train_scaled = X_train_scaled.to(device, dtype=torch.float32, non_blocking=True)
     
     # Convert temps to class labels (handle both CPU and GPU tensors)
-    y_train_cpu = y_train.cpu() if y_train.is_cuda else y_train
-    y_train_classes = torch.tensor([temp_to_class[y.item()] for y in y_train_cpu], dtype=torch.long).to(device)
+    y_train_classes = torch.tensor(y_train_classes_list, dtype=torch.long).to(device)
     
     if X_val is not None:
         X_val_scaled = (X_val - X_mean.to(device=X_val.device, dtype=X_val.dtype)) / X_std.to(device=X_val.device, dtype=X_val.dtype)
-        if X_val_scaled.device != device:
-            X_val_scaled = X_val_scaled.to(device, dtype=torch.bfloat16, non_blocking=True)
+        X_val_scaled = X_val_scaled.to(device, dtype=torch.float32, non_blocking=True)
         y_val_cpu = y_val.cpu() if y_val.is_cuda else y_val
         y_val_classes = torch.tensor([temp_to_class[y.item()] for y in y_val_cpu], dtype=torch.long).to(device)
+        print(f"  Validation class counts: {[int((y_val_cpu == temp).sum().item()) for temp in sorted(temp_to_class.keys())]}")
     
     best_val_loss = float('inf')
     patience_counter = 0
@@ -424,6 +537,9 @@ def train_classification_probe(X_train, y_train, X_val, y_val, temp_to_class, de
         optimizer.zero_grad()
         
         logits = model(X_train_scaled)
+        if epoch == 0:
+            print("  Epoch 1 logits sample (first 5):")
+            print(logits[:5].detach().cpu())
         loss = criterion(logits.to(dtype=torch.float32), y_train_classes)
         
         loss.backward()
@@ -434,6 +550,9 @@ def train_classification_probe(X_train, y_train, X_val, y_val, temp_to_class, de
             model.eval()
             with torch.no_grad():
                 logits_val = model(X_val_scaled)
+                if epoch == 0:
+                    print("  Epoch 1 val logits sample (first 5):")
+                    print(logits_val[:5].detach().cpu())
                 val_loss = criterion(logits_val.to(dtype=torch.float32), y_val_classes).item()
             
             if val_loss < best_val_loss:
@@ -460,8 +579,7 @@ def evaluate_regression(model, X, y, X_mean, X_std, device):
     
     # Move X to device for model inference if needed
     X_scaled = (X - X_mean.to(device=X.device, dtype=X.dtype)) / X_std.to(device=X.device, dtype=X.dtype)
-    if X_scaled.device != device:
-        X_scaled = X_scaled.to(device, dtype=torch.bfloat16)
+    X_scaled = X_scaled.to(device, dtype=torch.float32, non_blocking=True)
     
     with torch.no_grad():
         y_pred = model(X_scaled).to(dtype=torch.float32).cpu().numpy()
@@ -485,8 +603,7 @@ def evaluate_classification(model, X, y, temp_to_class, class_to_temp, X_mean, X
     
     # Move X to device for model inference if needed
     X_scaled = (X - X_mean.to(device=X.device, dtype=X.dtype)) / X_std.to(device=X.device, dtype=X.dtype)
-    if X_scaled.device != device:
-        X_scaled = X_scaled.to(device, dtype=torch.bfloat16)
+    X_scaled = X_scaled.to(device, dtype=torch.float32, non_blocking=True)
     
     with torch.no_grad():
         logits = model(X_scaled).to(dtype=torch.float32)
@@ -508,8 +625,6 @@ def main():
                         help='Path to activations directory')
     parser.add_argument('--layers', type=str, required=True,
                         help='Layer indices to train (e.g., "19" or "0,1,2,3" or "0-3")')
-    parser.add_argument('--token_every_n', type=int, default=10,
-                        help='Sample every nth token (default: 10)')
     parser.add_argument('--max_files_per_temp', type=int, default=None,
                         help='Max files per temperature (default: all)')
     parser.add_argument('--test_size', type=float, default=0.2,
@@ -528,6 +643,12 @@ def main():
                         help='Base output directory (default: probe_results)')
     parser.add_argument('--preload_to_gpu', action='store_true',
                         help='Preload data to GPU after loading (reduces RAM usage, speeds up training)')
+    parser.add_argument('--files_per_batch', type=int, default=4,
+                        help='Number of activation files to process together before cleanup (default: 4)')
+    parser.add_argument('--chunk_size', type=int, default=8,
+                        help='Number of files to accumulate per layer before concatenating (default: 8)')
+    parser.add_argument('--sample_tokens_per_sequence', type=int, default=50,
+                        help='Evenly sample this many tokens per activation sequence (default: 50; set <=0 to keep all)')
     
     args = parser.parse_args()
     
@@ -549,6 +670,9 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     print(f"Training layers: {layer_indices}")
+    print(f"Files per batch: {args.files_per_batch}")
+    print(f"Chunk size: {args.chunk_size}")
+    print(f"Sample tokens per sequence: {args.sample_tokens_per_sequence if args.sample_tokens_per_sequence > 0 else 'All'}")
     
     # Create organized output directory structure
     # Extract model name from activations_dir path
@@ -557,8 +681,8 @@ def main():
     
     # Create descriptive subdirectory name
     max_files_str = f"{args.max_files_per_temp}files" if args.max_files_per_temp else "allfiles"
-    token_str = f"every{args.token_every_n}tokens"
-    experiment_name = f"{model_name}_{max_files_str}_{token_str}"
+    sample_str = f"{args.sample_tokens_per_sequence}tokens" if args.sample_tokens_per_sequence and args.sample_tokens_per_sequence > 0 else "alltokens"
+    experiment_name = f"{model_name}_{max_files_str}_{sample_str}"
     
     output_dir = Path(args.output_dir) / experiment_name
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -573,7 +697,7 @@ def main():
         'model_name': model_name,
         'activations_dir': str(args.activations_dir),
         'max_files_per_temp': args.max_files_per_temp,
-        'token_every_n': args.token_every_n,
+        'sample_tokens_per_sequence': args.sample_tokens_per_sequence,
         'test_size': args.test_size,
         'val_size': args.val_size,
         'epochs': args.epochs,
@@ -581,6 +705,8 @@ def main():
         'patience': args.patience,
         'device': args.device,
         'layers_trained': layer_indices,
+        'files_per_batch': args.files_per_batch,
+        'chunk_size': args.chunk_size,
     }
     with open(config_path, 'w') as f:
         json.dump(experiment_config, f, indent=2)
@@ -596,11 +722,38 @@ def main():
     preload_device = 'cuda' if args.preload_to_gpu and torch.cuda.is_available() else 'cpu'
     
     data_by_layer, temp_to_class, class_to_temp = load_data_by_files(
-        args.activations_dir, layer_indices, args.token_every_n, 
-        args.max_files_per_temp, args.test_size, args.val_size,
-        preload_device=preload_device
+        args.activations_dir,
+        layer_indices,
+        args.sample_tokens_per_sequence,
+        args.max_files_per_temp,
+        args.test_size,
+        args.val_size,
+        preload_device=preload_device,
+        files_per_batch=args.files_per_batch,
+        chunk_size=args.chunk_size,
     )
     
+    # Debug: class distribution before training
+    if data_by_layer:
+        sample_layer = next(iter(data_by_layer.keys()), None)
+        if sample_layer is not None and sample_layer in data_by_layer:
+            print("\nClass distribution before training:")
+            distributions = {
+                'train': data_by_layer[sample_layer]['train'][1],
+                'val': data_by_layer[sample_layer]['val'][1],
+                'test': data_by_layer[sample_layer]['test'][1],
+            }
+            for split_name, y_tensor in distributions.items():
+                if y_tensor is None:
+                    print(f"  {split_name}: no data")
+                    continue
+                y_cpu = y_tensor.detach().cpu()
+                total = int(y_cpu.numel())
+                print(f"  {split_name} total: {total}")
+                for temp in sorted(temp_to_class.keys()):
+                    count = int((y_cpu == temp).sum().item())
+                    print(f"    Temp {temp}: {count}")
+
     # Train probes for each layer
     for layer_idx in layer_indices:
         if layer_idx not in data_by_layer:
@@ -633,7 +786,7 @@ def main():
         # Train classification probe
         print("\nTraining Classification Probe...")
         clf_model, clf_mean, clf_std = train_classification_probe(
-            X_train, y_train, X_val, y_val, temp_to_class, device,
+            X_train, y_train, X_val, y_val, temp_to_class, class_to_temp, device,
             args.epochs, args.lr, args.patience
         )
         

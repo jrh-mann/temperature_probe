@@ -3,16 +3,20 @@
 
 ACTIVATIONS_DIR="${1:-/workspace/activations/Qwen3-0.6B}"
 MAX_FILES="${2:-30}"  # Limit files per temperature for faster training
-TOKEN_EVERY_N="${3:-10}"
+SAMPLE_TOKENS_PER_SEQUENCE="${3:-50}"
 CUSTOM_LAYER_SPEC="${4:-}"
+FILES_PER_BATCH="${5:-64}"
+CHUNK_SIZE="${6:-64}"
 
 echo "Training probes for all layers"
 echo "Activations dir: $ACTIVATIONS_DIR"
 echo "Max files per temp: $MAX_FILES"
-echo "Token sampling: every $TOKEN_EVERY_N"
+echo "Sample tokens per sequence: $SAMPLE_TOKENS_PER_SEQUENCE"
 if [ -n "$CUSTOM_LAYER_SPEC" ]; then
     echo "Custom layer selection: $CUSTOM_LAYER_SPEC"
 fi
+echo "Files per batch: $FILES_PER_BATCH"
+echo "Chunk size: $CHUNK_SIZE"
 echo ""
 
 source /root/temperature_probe/.venv/bin/activate
@@ -28,7 +32,7 @@ echo "Detected $NUM_LAYERS layers"
 echo ""
 
 # Train layers in batches for efficiency (loads multiple layers at once)
-BATCH_SIZE=2
+BATCH_SIZE=10
 
 # Build list of target layers (optionally custom)
 declare -a TARGET_LAYERS=()
@@ -102,8 +106,10 @@ for ((idx=0; idx<${#TARGET_LAYERS[@]}; idx+=BATCH_SIZE)); do
     python3 utils/train_probe_v2.py \
         --activations_dir "$ACTIVATIONS_DIR" \
         --layers "$group_str" \
-        --token_every_n "$TOKEN_EVERY_N" \
         --max_files_per_temp "$MAX_FILES" \
+        --files_per_batch "$FILES_PER_BATCH" \
+        --chunk_size "$CHUNK_SIZE" \
+        --sample_tokens_per_sequence "$SAMPLE_TOKENS_PER_SEQUENCE" \
         --device cuda \
         --preload_to_gpu \
         --epochs 1000 \

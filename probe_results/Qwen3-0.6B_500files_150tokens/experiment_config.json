@@ -2,7 +2,7 @@
   "model_name": "Qwen3-0.6B",
   "activations_dir": "/workspace/activations/Qwen3-0.6B",
   "max_files_per_temp": 500,
-  "token_every_n": 10,
+  "sample_tokens_per_sequence": 150,
   "test_size": 0.2,
   "val_size": 0.2,
   "epochs": 1000,
@@ -10,7 +10,17 @@
   "patience": 50,
   "device": "cuda",
   "layers_trained": [
+    0,
+    1,
+    2,
     3,
-    7
-  ]
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+  ],
+  "files_per_batch": 64,
+  "chunk_size": 64
 }
